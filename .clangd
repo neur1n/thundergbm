@@ -1,0 +1,12 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    # - --cuda-path=/usr/local/cuda
+    # - -L/usr/local/cuda/lib64
+    # - -I/usr/local/cuda/include
+    - --cuda-path=D:/programs/CUDA/v12.4
+    - -LD:/programs/CUDA/v12.4/lib64
+    - -ID:/programs/CUDA/v12.4/include
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --generate-code*

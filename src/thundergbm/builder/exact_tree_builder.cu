@@ -40,9 +40,9 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
         SyncArray<int_float> rle_key(nnz);
         if (nnz * 4 > 1.5 * (1 << 30)) rle_key.resize(int(nnz * 0.1));
         auto rle_pid_data = make_transform_iterator(rle_key.device_data(),
-                                                    [=]__device__(int_float key) { return get<0>(key); });
+                                                    [=]__host__ __device__(int_float key) { return get<0>(key); });
         auto rle_fval_data = make_transform_iterator(rle_key.device_data(),
-                                                     [=]__device__(int_float key) { return get<1>(key); });
+                                                     [=]__host__ __device__(int_float key) { return get<1>(key); });
         {
 
             //gather g/h pairs and do prefix sum
@@ -78,7 +78,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                     //get feature value id mapping for partition, new -> old
                     {
 //                    TIMED_SCOPE(timerObj, "fvid_new2old");
-                        sequence(cuda::par, fvid_new2old.device_data(), fvid_new2old.device_end(), 0);
+                        sequence(thrust::cuda::par, fvid_new2old.device_data(), fvid_new2old.device_end(), 0);
 
                         //using prefix sum memory for temporary storage
                         cub_sort_by_key(fvid2pid, fvid_new2old, -1, true, (void *) gh_prefix_sum.device_data());
@@ -99,7 +99,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                                             columns.csc_val.device_data(),
                                             fvid_new2old.device_data())));//use fvid_new2old to access csc_val
                     n_split = reduce_by_key(
-                            cuda::par,
+                            thrust::cuda::par,
                             key_iter, key_iter + nnz,
                             make_permutation_iterator(                   //ins id -> gh pair
                                     gh_pair.device_data(),
@@ -114,7 +114,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
 
                     //prefix sum
                     inclusive_scan_by_key(
-                            cuda::par,
+                            thrust::cuda::par,
                             rle_pid_data, rle_pid_data + n_split,
                             gh_prefix_sum.device_data(),
                             gh_prefix_sum.device_data());
@@ -129,7 +129,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
             TIMED_SCOPE(timerObj, "find _split - calculate missing value");
             SyncArray<int> pid_ptr(n_partition + 1);
             counting_iterator<int> search_begin(0);
-            upper_bound(cuda::par, rle_pid_data, rle_pid_data + n_split, search_begin,
+            upper_bound(thrust::cuda::par, rle_pid_data, rle_pid_data + n_split, search_begin,
                         search_begin + n_partition, pid_ptr.device_data() + 1);
             LOG(DEBUG) << "pid_ptr = " << pid_ptr;
 
@@ -227,7 +227,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
             //reduce to get best split of each node for this feature
             SyncArray<int> feature_nodes_pid(n_partition);
             int n_feature_with_nodes = reduce_by_key(
-                    cuda::par,
+                    thrust::cuda::par,
                     rle_pid_data, rle_pid_data + n_split,
                     make_zip_iterator(make_tuple(counting_iterator<int>(0), gain.device_data())),
                     feature_nodes_pid.device_data(),
@@ -248,7 +248,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
             LOG(DEBUG) << "f n pid" << feature_nodes_pid;
             LOG(DEBUG) << "best rank & gain = " << best_idx_gain;
             n_nodes_in_level = reduce_by_key(
-                    cuda::par,
+                    thrust::cuda::par,
                     feature_nodes_pid.device_data(), feature_nodes_pid.device_data() + n_feature_with_nodes,
                     best_idx_gain.device_data(),
                     make_discard_iterator(),

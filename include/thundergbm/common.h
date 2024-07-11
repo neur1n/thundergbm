@@ -11,6 +11,9 @@
 #include "config.h"
 #include "thrust/tuple.h"
 
+#include "fasthb.cuh"
+#include "fasthb/impl/build.cuh"
+
 using std::vector;
 using std::string;
 
@@ -35,8 +38,7 @@ std::string string_format(const std::string &format, Args ... args) {
 }
 
 //data types
-typedef float float_type;
-//typedef double float_type;
+typedef double float_type;
 
 #define HOST_DEVICE __host__ __device__
 
@@ -78,6 +80,102 @@ struct GHPair {
         return os;
     }
 };
+
+template<>
+class fasthb::build::Op<GHPair, GHPair>
+{
+public:
+  using O = volatile GHPair;
+  using I = GHPair;
+
+  template<aggregate::Method method>
+  __host__ __device__
+  X_INL static void Aggregate(volatile O& dst, const I& src)
+  {
+#ifndef __CUDA_ARCH__
+#if __cplusplus >= 202002L
+    std::atomic<float_type> atomic_g{dst.g};
+    std::atomic<float_type> atomic_h{dst.h};
+
+    (void)atomic_g.fetch_add(
+        static_cast<float_type>(src.g), std::memory_order_release);
+    dst.g = atomic_g.load(std::memory_order_acquire);
+
+    (void)atomic_h.fetch_add(
+        static_cast<float_type>(src.h), std::memory_order_release);
+    dst.h = atomic_h.load(std::memory_order_acquire);
+#else
+    printf("Atomic operations for floating numbers are not implemented before C++20.\n");
+#endif  // __cplusplus
+#else
+    if (src.g != static_cast<float_type>(0)) {
+      (void)atomicAdd(
+          const_cast<float_type*>(&dst.g), static_cast<float_type>(src.g));
+    }
+    if (src.h != static_cast<float_type>(0)) {
+      (void)atomicAdd(
+          const_cast<float_type*>(&dst.h), static_cast<float_type>(src.h));
+    }
+#endif
+  }
+
+  template<binning::Method method>
+  __host__ __device__
+  X_INL static void Binning(index_t& index, const I& input, void* rest)
+  {
+    auto param{static_cast<binning::GivenIndexParam*>(rest)};
+    binning::GivenIndex(index, param->iteration, param->indices, param->length);
+  }
+
+  __host__ __device__
+  X_INL static void GetBinWidth(
+      I& bin_width, const index_t& num_bin, const I& lower, const I& upper)
+  {
+  }
+
+  template<typename O>
+  __host__ __device__
+  X_INL static void Reset(O& dst)
+  {
+    dst.g = static_cast<float_type>(0);
+    dst.h = static_cast<float_type>(0);
+  }
+
+  template<bool atomic, typename O>
+  __host__ __device__
+  X_INL static void Reduce(volatile O& dst, const O& src)
+  {
+    if constexpr (atomic) {
+#ifndef __CUDA_ARCH__
+#if __cplusplus >= 202002L
+      std::atomic<float_type> atomic_g{dst.g};
+      std::atomic<float_type> atomic_h{dst.h};
+
+      (void)atomic_g.fetch_add(
+          static_cast<float_type>(src.g), std::memory_order_release);
+      dst.g = atomic_g.load(std::memory_order_acquire);
+
+      (void)atomic_h.fetch_add(
+          static_cast<float_type>(src.h), std::memory_order_release);
+      dst.h = atomic_h.load(std::memory_order_acquire);
+#else
+#endif  // __cplusplus
+      printf("Atomic operations for floating numbers are not implemented before C++20.\n");
+#else
+      if (src.g != static_cast<float_type>(0)) {
+        (void)atomicAdd(
+            const_cast<float_type*>(&dst.g), static_cast<float_type>(src.g));
+      }
+      if (src.h != static_cast<float_type>(0)) {
+        (void)atomicAdd(
+            const_cast<float_type*>(&dst.h), static_cast<float_type>(src.h));
+      }
+#endif
+    } else {
+      dst = dst + src;
+    }
+  }
+};  // namespace fasthb::build::Op<GHPair, GHPair>
 
 typedef thrust::tuple<int, float_type> int_float;
 

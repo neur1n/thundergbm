@@ -1,6 +1,9 @@
 //
 // Created by shijiashuai on 2019-03-08.
+// Modified by lijihang on 2024-07-02 for C++17: random_shuffle -> shuffle.
 //
+#include <random>
+
 #include "thundergbm/builder/shard.h"
 #include "thrust/sequence.h"
 #include "thundergbm/util/device_lambda.cuh"
@@ -11,7 +14,9 @@ void Shard::column_sampling(float rate) {
         int n_column = columns.n_column;
         SyncArray<int> idx(n_column);
         thrust::sequence(thrust::cuda::par, idx.device_data(), idx.device_end(), 0);
-        std::random_shuffle(idx.host_data(), idx.host_data() + n_column);
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(idx.host_data(), idx.host_data() + n_column, g);
         int sample_count = max(1, int(n_column * rate));
         ignored_set.resize(n_column);
         auto idx_data = idx.device_data();

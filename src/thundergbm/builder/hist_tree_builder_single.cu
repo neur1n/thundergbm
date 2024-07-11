@@ -1,5 +1,6 @@
 //
 // Created by ss on 19-1-20.
+// Modified by lijihang on 2024-07-03 for inegrating FastHB.
 //
 #include "thundergbm/builder/hist_tree_builder_single.h"
 
@@ -11,6 +12,8 @@
 #include "thrust/sequence.h"
 #include "thrust/binary_search.h"
 #include "thundergbm/util/multi_device.h"
+
+#include "fasthb.cuh"
 
 #include "omp.h"
 #include "cusparse.h"
@@ -32,14 +35,14 @@ void check_hist_res(GHPair* hist, GHPair* hist_test, int n_bins){
     //check result
     float avg_diff_g = 0;
     float total_diff_g= 0;
-    
+
     for(int i = 0;i<n_bins;++i){
-        
+
         total_diff_g += abs(hist_test[i].g-hist[i].g);
-    
+
     }
     avg_diff_g = total_diff_g/n_bins;
-    
+
     LOG(INFO)<<"total diff g is "<<total_diff_g<<" avg diff g is "<<avg_diff_g;
 
 }
@@ -56,15 +59,15 @@ void HistTreeBuilder_single::get_bin_ids() {
         size_t nnz = columns.nnz;
         auto cut_row_ptr = cut.cut_row_ptr.device_data();
         auto cut_points_ptr = cut.cut_points_val.device_data();
-        
+
         int n_block = fminf((nnz / n_column - 1) / 256 + 1, 6 * 84);
         //original order csc
         //auto csc_val_origin_data = columns.csc_val_origin.device_data();
-        
+
         //auto &bin_id_origin = this->bin_id_origin[device_id];
         //bin_id_origin.resize(columns.nnz);
         //auto bin_id_origin_data = bin_id_origin.device_data();
-        
+
         auto &csr_row_ptr = this->csr_row_ptr[device_id];
         auto &csr_col_idx = this->csr_col_idx[device_id];
         auto &csr_bin_id  = this->csr_bin_id[device_id];
@@ -73,11 +76,11 @@ void HistTreeBuilder_single::get_bin_ids() {
         csr_row_ptr.resize(n_instances+1);
         csr_col_idx.resize(nnz);
         csr_bin_id.resize(nnz);
-        
+
         csr_row_ptr.set_device_data(columns.csr_row_ptr.device_data());
         csr_col_idx.set_device_data(columns.csr_col_idx.device_data());
 
-        {   //in thrust lowerbound <= first element, upperbound is < first element 
+        {   //in thrust lowerbound <= first element, upperbound is < first element
             auto upperBound = [=]__device__(const float_type *search_begin, const float_type *search_end, float_type val) {
                 const float_type *left = search_begin;
                 const float_type *right = search_end - 1;
@@ -129,6 +132,19 @@ void HistTreeBuilder_single::get_bin_ids() {
     });
 }
 
+template<typename O>
+static x_err Callback(
+    volatile O* const hist, const index_t begin, const index_t end,
+    void* user_data)
+{
+  x_err err;
+
+  for (index_t i = begin; i < end; ++i) {
+  }
+
+  return err;
+}
+
 void HistTreeBuilder_single::find_split(int level, int device_id) {
     std::chrono::high_resolution_clock timer;
 
@@ -143,7 +159,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
     auto &last_hist = this->last_hist[device_id];
     int max_trick_depth = columns.max_trick_depth;
     int max_trick_nodes = columns.max_trick_nodes;
-    
+
     TIMED_FUNC(timerObj);
     int n_nodes_in_level = static_cast<int>(pow(2, level));
     int nid_offset = static_cast<int>(pow(2, level) - 1);
@@ -159,7 +175,9 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
     auto &csr_row_ptr = this->csr_row_ptr[device_id];
     auto &csr_col_idx = this->csr_col_idx[device_id];
     auto &csr_bin_id  = this->csr_bin_id[device_id];
-    
+    x_log('w', nullptr, "row: %zu, col: %zu, bin: %zu",
+        csr_row_ptr.size(), csr_col_idx.size(), csr_bin_id.size());
+
     auto csr_row_ptr_data = csr_row_ptr.device_data();
     auto csr_col_idx_data = csr_col_idx.device_data();
     auto csr_bin_id_data = csr_bin_id.device_data();
@@ -178,10 +196,38 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
         auto t_build_start = timer.now();
 
         //calculate split information for each split
-        SyncArray<GHPair> hist(len_hist);
-        SyncArray<GHPair> missing_gh(len_missing);
+        double elapsed{0.0};
+        constexpr auto bng{fasthb::binning::Method::GivenIndex};
+        constexpr auto agg{fasthb::aggregate::Method::Add};
+
+        fasthb::Hist<false, GHPair> hist(csr_row_ptr.size(), len_hist);
+        fasthb::Hist<false, GHPair> missing_gh(csr_row_ptr.size(), len_missing);
+        hist.Reset();
+        missing_gh.Reset();
+
+        fasthb::data::LibSVM<false, GHPair> input;
+        input.Load<true>(
+            nullptr, 0,
+            nullptr, 0,
+            gh_pair.device_data(), gh_pair.size(),
+            cut.cut_row_ptr.device_data(), cut.cut_row_ptr.size(),
+            nullptr, 0);
+        input.Format() = fasthb::data::Format::CSR;
+        input.NumElem() = static_cast<index_t>(columns.nnz);
+        input.NumFeat() = static_cast<index_t>(cut.cut_row_ptr.size());
+        input.NumInst() = static_cast<index_t>(gh_pair.size());
+
+        fasthb::binning::GivenIndexParam binning_param;
+        binning_param.indices = csr_bin_id_data;
+        binning_param.length = static_cast<index_t>(csr_bin_id.size());
+        binning_param.iteration = 0;
+
+        fasthb::binning::GivenIndexParam* d_binning_param{nullptr};
+        cudaMalloc(&d_binning_param, sizeof(fasthb::binning::GivenIndexParam));
+        fasthb::binning::GivenIndexParam::Copy<false>(d_binning_param, &binning_param);
+
         auto cut_fid_data = cut.cut_fid.device_data();
-        auto i2fid = [=] __device__(int i) { return cut_fid_data[i % n_bins]; };
+        auto i2fid = [=]__host__ __device__(int i) { return cut_fid_data[i % n_bins]; };
         auto hist_fid = make_transform_iterator(counting_iterator<int>(0), i2fid);
         {
             {
@@ -195,32 +241,44 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
 
                         TSTART(hist)
 
-                        auto hist_data = hist.device_data();
-                        auto cut_row_ptr_data = cut.cut_row_ptr.device_data();
-                        auto gh_data = gh_pair.device_data();
-                        //auto dense_bin_id_data = dense_bin_id.device_data();
-                        auto n_instances = this->n_instances;
-                        device_loop_hist_csr_root(n_instances,csr_row_ptr_data, [=]__device__(int i,int j){
-                        
-                            //int fid = csr_col_idx_data[j];
-                            int bid = (int)csr_bin_id_data[j];
-                            //int feature_offset = cut_row_ptr_data[fid];
-                            const GHPair src = gh_data[i];
-                            //GHPair &dest = hist_data[feature_offset + bid]; 
-                            GHPair &dest = hist_data[bid]; 
-                            if(src.h != 0)
-                                atomicAdd(&dest.h, src.h);
-                            if(src.g != 0)
-                                atomicAdd(&dest.g, src.g);                            
-                        
-                        },n_block);
+                        builder.Pre<bng, agg>(hist, input, -1, device_id, fasthb::resource::Method::FastHB);
+                        builder.Run<bng, agg>(elapsed, hist, input, -1, d_binning_param);
+
+                        //auto hist_data = const_cast<GHPair*>(hist.Data());
+                        //auto cut_row_ptr_data = cut.cut_row_ptr.device_data();
+                        //auto gh_data = gh_pair.device_data();
+                        ////auto dense_bin_id_data = dense_bin_id.device_data();
+                        //auto n_instances = this->n_instances;
+                        //device_loop_hist_csr_root(n_instances,csr_row_ptr_data, [=]__device__(int i,int j){
+
+                        //    //int fid = csr_col_idx_data[j];
+                        //    int bid = (int)csr_bin_id_data[j];
+                        //    //int feature_offset = cut_row_ptr_data[fid];
+                        //    const GHPair src = gh_data[i];
+                        //    //GHPair &dest = hist_data[feature_offset + bid];
+                        //    GHPair &dest = hist_data[bid];
+                        //    if(src.h != 0)
+                        //        atomicAdd(&dest.h, src.h);
+                        //    if(src.g != 0)
+                        //        atomicAdd(&dest.g, src.g);
+
+                        //},n_block);
 
                         TEND(hist)
                         total_hist_time+=TINT(hist);
-                        
+
+                        fasthb::Hist<true, GHPair> host_hist(csr_row_ptr.size(), len_hist);
+                        host_hist.CopyFrom(hist);
+                        FILE* stream{nullptr};
+                        x_fopen(&stream, "hist_fasthb", "w");
+                        for (int i = 0; i < len_hist; ++i) {
+                          fprintf(stream, "[%d] %f, %f\n", i, host_hist.Data()[i].g, host_hist.Data()[i].h);
+                        }
+                        fclose(stream);
+
                         //LOG(INFO)<<"root hist feature 4447 last bin"<<hist.host_data()[cut.cut_row_ptr.host_data()[4448]-1];
                         //LOG(INFO)<<"root hist feature 4447 last index is "<<cut.cut_row_ptr.host_data()[4448]-1;
-                        
+
                         //device_loop(n_instances,[=]__device__(int i){
                         //    auto st = csr_row_ptr_data[i];
                         //    auto ed = csr_row_ptr_data[i+1];
@@ -248,20 +306,18 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
 
                         TSTART(evaluate)
 
-                        //new code 
-                        last_hist.copy_from(hist.device_data(),n_bins);
+                        //new code
+                        last_hist.copy_from(const_cast<const GHPair*>(hist.Data()), n_bins);
                         cudaDeviceSynchronize();
-                        
 
+                        inclusive_scan_by_key(thrust::cuda::par, hist_fid, hist_fid + n_bins,
+                                      const_cast<GHPair*>(hist.Data()), const_cast<GHPair*>(hist.Data()));
 
-                        inclusive_scan_by_key(cuda::par, hist_fid, hist_fid + n_bins,
-                                      hist.device_data(), hist.device_data());
-
-                        { //missing 
+                        { //missing
                             auto nodes_data = tree.nodes.device_data();
-                            auto missing_gh_data = missing_gh.device_data();
+                            auto missing_gh_data = const_cast<GHPair*>(missing_gh.Data());
                             auto cut_row_ptr = cut.cut_row_ptr.device_data();
-                            auto hist_data = hist.device_data();
+                            auto hist_data = const_cast<GHPair*>(hist.Data());
                             device_loop(n_column, [=]__device__(int pid) {
                                 int nid0 = pid / n_column;
                                 int nid = nid0 + nid_offset;
@@ -289,9 +345,9 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             };
 
                             const Tree::TreeNode *nodes_data = tree.nodes.device_data();
-                            GHPair *gh_prefix_sum_data = hist.device_data();
+                            GHPair *gh_prefix_sum_data = const_cast<GHPair*>(hist.Data());
                             float_type *gain_data = gain.device_data();
-                            const auto missing_gh_data = missing_gh.device_data();
+                            const auto missing_gh_data = const_cast<const GHPair*>(missing_gh.Data());
                             auto ignored_set_data = ignored_set.device_data();
                             auto cut_row_ptr = cut.cut_row_ptr.device_data();
                             //for lambda expression
@@ -337,7 +393,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             auto nid_iterator = make_transform_iterator(counting_iterator<int>(0), placeholders::_1 / n_bins);
 
                             reduce_by_key(
-                                    cuda::par,
+                                    thrust::cuda::par,
                                     nid_iterator, nid_iterator + n_split,
                                     make_zip_iterator(make_tuple(counting_iterator<int>(0), gain.device_data())),
                                     make_discard_iterator(),
@@ -348,11 +404,11 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             LOG(DEBUG) << n_split;
                             LOG(DEBUG) << "best rank & gain = " << best_idx_gain;
                         }
-					
+
                         {
                             const int_float *best_idx_gain_data = best_idx_gain.device_data();
-                            auto hist_data = hist.device_data();
-                            const auto missing_gh_data = missing_gh.device_data();
+                            auto hist_data = const_cast<GHPair*>(hist.Data());
+                            const auto missing_gh_data = const_cast<const GHPair*>(missing_gh.Data());
                             auto cut_val_data = cut.cut_points_val.device_data();
 
                             sp.resize(n_nodes_in_level);
@@ -390,7 +446,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                         }
                         TEND(evaluate)
                         total_evaluate_time+=TINT(evaluate);
-                        
+
                     } else {
                         //otherwise
                         auto t_dp_begin = timer.now();
@@ -400,15 +456,15 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             TIMED_SCOPE(timerObj, "data partitioning");
                             SyncArray<int> nid4sort(n_instances);
                             nid4sort.copy_from(ins2node_id[device_id]);
-                            sequence(cuda::par, node_idx.device_data(), node_idx.device_end(), 0);
+                            sequence(thrust::cuda::par, node_idx.device_data(), node_idx.device_end(), 0);
 
                             cub_sort_by_key(nid4sort, node_idx);
                             auto counting_iter = make_counting_iterator < int > (nid_offset);
                             node_ptr.host_data()[0] =
-                                    lower_bound(cuda::par, nid4sort.device_data(), nid4sort.device_end(), nid_offset) -
+                                    lower_bound(thrust::cuda::par, nid4sort.device_data(), nid4sort.device_end(), nid_offset) -
                                     nid4sort.device_data();
 
-                            upper_bound(cuda::par, nid4sort.device_data(), nid4sort.device_end(), counting_iter,
+                            upper_bound(thrust::cuda::par, nid4sort.device_data(), nid4sort.device_end(), counting_iter,
                                         counting_iter + n_nodes_in_level, node_ptr.device_data() + 1);
                             LOG(DEBUG) << "node ptr = " << node_ptr;
                             cudaDeviceSynchronize();
@@ -447,12 +503,12 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             int nid0_to_substract = i * 2 + 1;
                             int n_ins_left = node_ptr_data[nid0_to_compute + 1] - node_ptr_data[nid0_to_compute];
                             int n_ins_right = node_ptr_data[nid0_to_substract + 1] - node_ptr_data[nid0_to_substract];
-                            
+
                             //LOG(INFO)<<"node index  "<<nid_offset+i*2<<", n_ins_left "<<n_ins_left;
                             //LOG(INFO)<<"node index  "<<nid_offset+i*2+1<<", n_ins_right "<<n_ins_right;
-                            
-                            if (max(n_ins_left, n_ins_right) == 0) 
-                            {   
+
+                            if (max(n_ins_left, n_ins_right) == 0)
+                            {
                                 auto nodes_data = tree.nodes.device_data();
                                 auto sp_data = sp.device_data();
                                 device_loop(2, [=]__device__(int i) {
@@ -465,7 +521,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             }
                             if (n_ins_left > n_ins_right)
                                 swap(nid0_to_compute, nid0_to_substract);
-                            
+
                             size_t computed_hist_pos = nid0_to_compute%2;
                             size_t to_compute_hist_pos = 1-computed_hist_pos;
 
@@ -475,7 +531,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 int nid0 = nid0_to_compute;
                                 auto idx_begin = node_ptr.host_data()[nid0];
                                 auto idx_end = node_ptr.host_data()[nid0 + 1];
-                                auto hist_data = hist.device_data() + computed_hist_pos*n_bins;
+                                auto hist_data = const_cast<GHPair*>(hist.Data()) + computed_hist_pos*n_bins;
                                 this->total_hist_num++;
 
                                 //reset zero
@@ -518,27 +574,27 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                     //            atomicAdd(&dest.g, src.g);
                                     //        }
                                     //    }
-                                    //    
+                                    //
                                     //});
 
-                                
+
                             }
                             if(max_trick_depth<0 || level<=max_trick_depth||(nid0_to_substract / 2)<max_trick_nodes){
                                 //subtract
                                 {
-                                    auto hist_data_computed = hist.device_data() + computed_hist_pos * n_bins;
-                                    auto hist_data_to_compute = hist.device_data() + to_compute_hist_pos * n_bins;
+                                    auto hist_data_computed = const_cast<GHPair*>(hist.Data()) + computed_hist_pos * n_bins;
+                                    auto hist_data_to_compute = const_cast<GHPair*>(hist.Data()) + to_compute_hist_pos * n_bins;
                                     auto father_hist_data = last_hist.device_data() + (size_t)(nid0_to_substract / 2) * n_bins;
-                                    
+
                                     if(level%2==0){
                                         size_t st_pos = (((half_last_hist_len+(nid0_to_substract / 2)))%last_hist_len)* n_bins;
                                         father_hist_data = last_hist.device_data() + st_pos ;
                                     }
-                                    
+
                                     device_loop(n_bins, [=]__device__(int i) {
                                         hist_data_to_compute[i] = father_hist_data[i] - hist_data_computed[i];
                                     });
-							    	
+
                                 }
                             }
                             else{
@@ -546,7 +602,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 int nid0 = nid0_to_substract;
                                 auto idx_begin = node_ptr.host_data()[nid0];
                                 auto idx_end = node_ptr.host_data()[nid0 + 1];
-                                auto hist_data = hist.device_data() + to_compute_hist_pos*n_bins;
+                                auto hist_data = const_cast<GHPair*>(hist.Data()) + to_compute_hist_pos*n_bins;
 
                                 cudaMemset(hist_data, 0, n_bins*sizeof(GHPair));
 
@@ -578,7 +634,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 if(level%2==0){
                                     //even level
                                     // LOG(INFO)<<"start_pos in even level "<<2*i;
-                                    cudaMemcpy(last_hist.device_data()+(size_t)2*i*n_bins, hist.device_data(), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
+                                    cudaMemcpy(last_hist.device_data()+(size_t)2*i*n_bins, const_cast<const GHPair*>(hist.Data()), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
                                 }
                                 else{
                                     //odd level
@@ -587,40 +643,40 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                     if(param.depth!=3){
                                         //size_t start_pos = ((half_last_hist_len+2*i)%last_hist_len)*n_bins;
                                         // LOG(INFO)<<"start_pos in odd level "<<((half_last_hist_len+2*i)%last_hist_len);
-                                        cudaMemcpy(last_hist.device_data()+start_pos,hist.device_data(), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
+                                        cudaMemcpy(last_hist.device_data()+start_pos, const_cast<const GHPair*>(hist.Data()), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
                                     }else{
-                                        cudaMemcpy(last_hist.device_data()+start_pos,hist.device_data(), n_bins*sizeof(GHPair), cudaMemcpyDefault);
-                                        
-                                        cudaMemcpy(last_hist.device_data(),hist.device_data()+n_bins, n_bins*sizeof(GHPair), cudaMemcpyDefault);
+                                        cudaMemcpy(last_hist.device_data()+start_pos, const_cast<const GHPair*>(hist.Data()), n_bins*sizeof(GHPair), cudaMemcpyDefault);
+
+                                        cudaMemcpy(last_hist.device_data(), const_cast<const GHPair*>(hist.Data())+n_bins, n_bins*sizeof(GHPair), cudaMemcpyDefault);
                                     }
                                 }
                             }
                             //parent array not enough, part nodes use trick
-                            else if(level<(param.depth-1) && level>=max_trick_depth && 2*i<max_trick_nodes){ 
+                            else if(level<(param.depth-1) && level>=max_trick_depth && 2*i<max_trick_nodes){
                                 if(level%2==0){
-                                    cudaMemcpy(last_hist.device_data()+(size_t)2*i*n_bins, hist.device_data(), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
+                                    cudaMemcpy(last_hist.device_data()+(size_t)2*i*n_bins, const_cast<const GHPair*>(hist.Data()), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
                                 }
                                 else{
                                     size_t start_pos = (half_last_hist_len+2*i)*n_bins;
-                                    cudaMemcpy(last_hist.device_data()+start_pos,hist.device_data(), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
+                                    cudaMemcpy(last_hist.device_data()+start_pos, const_cast<const GHPair*>(hist.Data()), 2*n_bins*sizeof(GHPair), cudaMemcpyDefault);
                                 }
-                                
+
                             }
 
 
                             cudaDeviceSynchronize();
-                            
-                            TSTART(evaluate)
-                            inclusive_scan_by_key(cuda::par, hist_fid, hist_fid + 2*n_bins,
-                                        hist.device_data(), 
-                                        hist.device_data());
 
-                        
-                            { //missing 
+                            TSTART(evaluate)
+                            inclusive_scan_by_key(thrust::cuda::par, hist_fid, hist_fid + 2*n_bins,
+                                        const_cast<GHPair*>(hist.Data()),
+                                        const_cast<GHPair*>(hist.Data()));
+
+
+                            { //missing
                                 auto nodes_data = tree.nodes.device_data();
-                                auto missing_gh_data = missing_gh.device_data();
+                                auto missing_gh_data = const_cast<GHPair*>(missing_gh.Data());
                                 auto cut_row_ptr = cut.cut_row_ptr.device_data();
-                                auto hist_data = hist.device_data();
+                                auto hist_data = const_cast<GHPair*>(hist.Data());
                                 int loop_len = n_column*2;
                                 device_loop(loop_len, [=]__device__(int pid) {
                                     int nid0 = (pid / n_column);
@@ -647,12 +703,12 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 };
 
                                 const Tree::TreeNode *nodes_data = tree.nodes.device_data();
-                                GHPair *gh_prefix_sum_data = hist.device_data();
+                                GHPair *gh_prefix_sum_data = const_cast<GHPair*>(hist.Data());
                                 float_type *gain_data = gain.device_data();
-                                const auto missing_gh_data = missing_gh.device_data();
+                                const auto missing_gh_data = const_cast<const GHPair*>(missing_gh.Data());
                                 auto ignored_set_data = ignored_set.device_data();
                                 auto cut_row_ptr = cut.cut_row_ptr.device_data();
-                                
+
                                 //for lambda expression
                                 float_type mcw = param.min_child_weight;
                                 float_type l = param.lambda;
@@ -681,7 +737,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 });
                                 LOG(DEBUG) << "gain = " << gain;
                             }
-                            
+
                             {
                     //            TIMED_SCOPE(timerObj, "get best gain");
                                 auto arg_abs_max = []__device__(const int_float &a, const int_float &b) {
@@ -694,7 +750,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 auto nid_iterator = make_transform_iterator(counting_iterator<int>(0), placeholders::_1 / n_bins);
 
                                 reduce_by_key(
-                                        cuda::par,
+                                        thrust::cuda::par,
                                         nid_iterator, nid_iterator + 2*n_bins,
                                         make_zip_iterator(make_tuple(counting_iterator<int>(0), gain.device_data())),
                                         make_discard_iterator(),
@@ -708,18 +764,18 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                             //get split points
                             {
                                 const int_float *best_idx_gain_data = best_idx_gain.device_data();
-                                auto hist_data = hist.device_data();
-                                const auto missing_gh_data = missing_gh.device_data();
+                                auto hist_data = const_cast<GHPair*>(hist.Data());
+                                const auto missing_gh_data = const_cast<const GHPair*>(missing_gh.Data());
                                 auto cut_val_data = cut.cut_points_val.device_data();
 
-                                
+
                                 auto sp_data = sp.device_data();
                                 auto nodes_data = tree.nodes.device_data();
 
                                 int column_offset = columns.column_offset;
 
                                 auto cut_row_ptr_data = cut.cut_row_ptr.device_data();
-                                
+
                                 device_loop(2, [=]__device__(int i) {
                                     int_float bst = best_idx_gain_data[i];
                                     float_type best_split_gain = get<1>(bst);
@@ -737,7 +793,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                     sp_data[i+2*tmp_index].split_bid = (unsigned char) (split_index % n_bins - cut_row_ptr_data[fid]);
                                     sp_data[i+2*tmp_index].fea_missing_gh = missing_gh_data[(i) * n_column + hist_fid[split_index]];
                                     sp_data[i+2*tmp_index].default_right = best_split_gain < 0;
-                                   
+
                                     sp_data[i+2*tmp_index].lch_sum_gh = GHPair(0);
                                     sp_data[i+2*tmp_index].fval = cut_val_data[cut_row_ptr_data[fid]] - fabsf(cut_val_data[cut_row_ptr_data[fid]])- 1e-5;
                                     //TODO improve implementation
@@ -748,7 +804,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                     }
 
                                 });
-                                
+
                             }
 
                            TEND(evaluate)
@@ -762,18 +818,19 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                         //missing_gh.resize(0);
                         //gain.resize(0);
                         //best_idx_gain.resize(0);
-                        
-                            
+
+
                     }//end # node > 1
-                    
+
                 }
-                
+
             }
         }
         //calculate gain of each split
 
-        
-        
+        cudaFree(d_binning_param);
+
+
     }
 
     LOG(DEBUG) << "split points (gain/fea_id/nid): " << sp;
@@ -792,9 +849,9 @@ void HistTreeBuilder_single::init(const DataSet &dataset, const GBMParam &param)
         shards[i].ignored_set = SyncArray<bool>(dataset.n_features());
     }
     SparseColumns columns;
-    
+
     columns.to_gpu(dataset, v_columns);
-    
+
     cut = vector<HistCut>(param.n_device);
     //dense_bin_id = MSyncArray<unsigned char>(param.n_device);
     last_hist = MSyncArray<GHPair>(param.n_device);
@@ -807,16 +864,16 @@ void HistTreeBuilder_single::init(const DataSet &dataset, const GBMParam &param)
     //bin_id_origin = MSyncArray<unsigned char>(param.n_device);
     DO_ON_MULTI_DEVICES(param.n_device, [&](int device_id){
         cut[device_id].get_cut_points_single(shards[device_id].columns, param.max_num_bin, n_instances);
-        
+
         size_t free_byte,total_byte;
         cudaError_t cuda_status = cudaMemGetInfo(&free_byte, &total_byte);
         LOG(INFO)<<"free memory now is "<<free_byte / (1024.0 * 1024.0*1024) << " GB";
         //keep some extra memory
         free_byte = free_byte - (size_t)3*1024*1024*1024;
-        
+
         size_t need_size = (1 << (param.depth-2)) * cut[device_id].cut_points_val.size();
         LOG(INFO)<<"last hist size is "<<need_size*8/(1024*1024*1024.0)<<"GB";
-        
+
         if(need_size*8>free_byte)
         {
             size_t max_trick_depth = log2(free_byte/(cut[device_id].cut_points_val.size()*8));
@@ -824,11 +881,11 @@ void HistTreeBuilder_single::init(const DataSet &dataset, const GBMParam &param)
             shards[device_id].columns.max_trick_depth = max_trick_depth;
             //half of the max nodes
             //shards[device_id].columns.max_trick_nodes = 1<<(max_trick_depth-1);
-            //need_size = (1<<max_trick_depth)* cut[device_id].cut_points_val.size(); 
+            //need_size = (1<<max_trick_depth)* cut[device_id].cut_points_val.size();
             shards[device_id].columns.max_trick_nodes = free_byte/(cut[device_id].cut_points_val.size()*8)/2;
-            need_size = shards[device_id].columns.max_trick_nodes*2* cut[device_id].cut_points_val.size(); 
+            need_size = shards[device_id].columns.max_trick_nodes*2* cut[device_id].cut_points_val.size();
         }
-        LOG(INFO)<<"real last hist size is "<<need_size*8/(1024*1024*1024.0)<<"GB";
+        LOG(INFO)<<"real last hist size is "<<need_size*sizeof(float_type)*2/(1024*1024*1024.0)<<"GB";
         last_hist[device_id].resize(need_size);
    });
     get_bin_ids();
@@ -908,13 +965,13 @@ void HistTreeBuilder_single::update_tree() {
 void HistTreeBuilder_single::update_ins2node_id() {
     TIMED_FUNC(timerObj);
     DO_ON_MULTI_DEVICES(param.n_device, [&](int device_id){
-        
+
         auto &columns = shards[device_id].columns;
         HistCut &cut = this->cut[device_id];
-        
+
         auto &csr_row_ptr = this->csr_row_ptr[device_id];
         auto &csr_bin_id  = this->csr_bin_id[device_id];
-        
+
         auto csr_row_ptr_data = csr_row_ptr.device_data();
         auto csr_bin_id_data = csr_bin_id.device_data();
 
@@ -923,7 +980,7 @@ void HistTreeBuilder_single::update_ins2node_id() {
         using namespace thrust;
         int n_column = columns.n_column;
         //int nnz = columns.nnz;
-        
+
         // int n_block = fminf((nnz / n_column - 1) / 256 + 1, 4 * 56);
 
         SyncArray<bool> has_splittable(1);
@@ -938,7 +995,7 @@ void HistTreeBuilder_single::update_ins2node_id() {
         //1.得到划分的split bin_id，然后从csr_bin_id中寻找，这样寻找的范围是一个instance中nnz的长度
         //2、得到划分的split feature 和split feature，在csr中寻找instance的feature和对应的value，这需要保留value数组
         //选择第一种
-        auto binary_search = [=]__device__( size_t search_begin,  size_t search_end, 
+        auto binary_search = [=]__device__( size_t search_begin,  size_t search_end,
                                             const size_t cut_begin, const size_t cut_end,
                                             const int *csr_bin_id_data) {
             int previous_middle = -1;
@@ -965,7 +1022,7 @@ void HistTreeBuilder_single::update_ins2node_id() {
             return -1;
         };
 
-        //auto loop_search = [=]__device__( size_t search_begin,  size_t search_end, 
+        //auto loop_search = [=]__device__( size_t search_begin,  size_t search_end,
         //                                    const size_t cut_begin, const size_t cut_end,
         //                                    const int *csr_bin_id_data) {
         //    for(int i =search_begin;i<=search_end;i++){
@@ -983,7 +1040,7 @@ void HistTreeBuilder_single::update_ins2node_id() {
             int split_fid = node.split_feature_id;
             if (node.splittable() && ((split_fid - column_offset < n_column) && (split_fid >= column_offset))) {
                 h_s_data[0] = true;
-                int split_bid = (int)node.split_bid+cut_row_ptr[split_fid]; 
+                int split_bid = (int)node.split_bid+cut_row_ptr[split_fid];
                 int bid = binary_search(csr_row_ptr_data[iid],csr_row_ptr_data[iid+1],
                                         cut_row_ptr[split_fid],cut_row_ptr[split_fid+1],
                                         csr_bin_id_data);
@@ -1002,7 +1059,7 @@ void HistTreeBuilder_single::update_ins2node_id() {
 
                 if ((bid == -1 && node.default_right) || (bid >= split_bid && bid>=0))
                     to_left = false;
-                 
+
                 if (to_left) {
                     //goes to left child
                     nid_data[iid] = node.lch_index;
@@ -1012,8 +1069,8 @@ void HistTreeBuilder_single::update_ins2node_id() {
                 }
             }
         });
-        
-       
+
+
         LOG(DEBUG) << "new tree_id = " << ins2node_id[device_id];
         has_split[device_id] = has_splittable.host_data()[0];
     });

@@ -1,55 +1,59 @@
-if(MSVC)
-    cmake_minimum_required(VERSION 3.4)
-else()
-    cmake_minimum_required(VERSION 2.8)
-endif()
-project(thundergbm)
-if(MSVC)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
-endif()
+# NOTE: 3.22 is supported by Ubuntu 22.04, and 3.16 in Ubuntu 20.04 is too old.
+CMAKE_MINIMUM_REQUIRED(VERSION 3.22 FATAL_ERROR)
+PROJECT(thundergbm LANGUAGES CXX CUDA)
 
-find_package(CUDA REQUIRED QUIET)
-find_package(OpenMP REQUIRED QUIET)
+IF(MSVC)
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
+ELSE()
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+ENDIF()
 
-if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
-endif ()
+SET(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
+SET(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
+SET(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
-# CUDA 11
-if(CUDA_VERSION VERSION_LESS "11.0")
-    set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++11 -lineinfo --expt-extended-lambda --default-stream per-thread")
-if (CMAKE_VERSION VERSION_LESS "3.1")
-    add_compile_options("-std=c++11")
-else ()
-    set(CMAKE_CXX_STANDARD 11)
-endif ()
-else()
-    set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++14 -lineinfo --expt-extended-lambda --default-stream per-thread")
-endif()
+SET(CMAKE_CUDA_ARCHITECTURES 89)
 
-if (OPENMP_FOUND)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-endif ()
+SET(CMAKE_CUDA_STANDARD 17)
+SET(CMAKE_CUDA_STANDARD_REQUIRED ON)
+IF(MSVC)
+  SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/openmp --default-stream=per-thread --extended-lambda --generate-line-info")
+ELSE()
+  SET(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp --default-stream=per-thread --extended-lambda --generate-line-info")
+ENDIF()
 
-# for easylogging++ configuration
-add_definitions("-DELPP_FEATURE_PERFORMANCE_TRACKING")
-add_definitions("-DELPP_THREAD_SAFE")
-add_definitions("-DELPP_STL_LOGGING")
-add_definitions("-DELPP_NO_LOG_TO_FILE") 
-# includes
-set(COMMON_INCLUDES ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/cub)
-include_directories(${COMMON_INCLUDES})
+SET(CMAKE_CXX_STANDARD 17)
+SET(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_subdirectory(src/thundergbm)
+FIND_PACKAGE(CUDAToolkit REQUIRED)
 
-set(BUILD_TESTS OFF CACHE BOOL "Build Tests")
-if (BUILD_TESTS)
-    add_subdirectory(src/test)
-endif ()
+FIND_PACKAGE(OpenMP REQUIRED)
+IF(OPENMP_FOUND)
+  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+  SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
+ENDIF()
+
+# easylogging++
+ADD_DEFINITIONS("-DELPP_FEATURE_PERFORMANCE_TRACKING")
+ADD_DEFINITIONS("-DELPP_THREAD_SAFE")
+ADD_DEFINITIONS("-DELPP_STL_LOGGING")
+ADD_DEFINITIONS("-DELPP_NO_LOG_TO_FILE")
 
 # configuration file
-set(DATASET_DIR ${PROJECT_SOURCE_DIR}/datasets/)
-configure_file(include/thundergbm/config.h.in config.h)
+SET(DATASET_DIR ${PROJECT_SOURCE_DIR}/datasets/)
+CONFIGURE_FILE(${PROJECT_SOURCE_DIR}/include/thundergbm/config.h.in config.h)
 
+INCLUDE_DIRECTORIES(
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+SET(BUILD_TESTS OFF CACHE BOOL "Build Tests")
+IF(BUILD_TESTS)
+  ADD_SUBDIRECTORY(src/test)
+ENDIF()
+
+INCLUDE(${PROJECT_SOURCE_DIR}/thirdparty/FastHB/cmake/FastHB-source.cmake)
+
+ADD_SUBDIRECTORY(src/thundergbm)

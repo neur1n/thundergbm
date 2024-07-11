@@ -101,7 +101,7 @@ void syncarray_resize(SyncArray<T> &buf_array, int new_size) {
 }
 
 
-void unique_by_flag(SyncArray<float> &target_arr, SyncArray<int> &flags, int n_columns) {
+void unique_by_flag(SyncArray<float_type> &target_arr, SyncArray<int> &flags, int n_columns) {
     using namespace thrust::placeholders;
 
     float max_elem = max_elements(target_arr);
