@@ -81,57 +81,89 @@ struct GHPair {
     }
 };
 
+__host__ __device__
+X_INL void IterateThunderGBM(index_t& it, void** args)
+{
+  assert(args && args[0] && args[1] && args[2]);
+
+  int* node_idx_data{static_cast<int*>(args[0])};
+  int node_idx_data_length{*static_cast<int*>(args[1])};
+  int idx_begin{*static_cast<int*>(args[2])};
+
+  if (it > node_idx_data_length) {
+    return;
+  }
+
+  it = node_idx_data[it + idx_begin];
+}
+
+template<typename I>
+__host__ __device__
+X_INL void BinningThunderGBM(
+    index_t& index, const I* input, const index_t* data_offset,
+    const index_t iid, const index_t fid, void** args)
+{
+  assert(data_offset && args && args[0] && args[1]);
+
+  index_t* indices{static_cast<index_t*>(args[0])};
+  index_t length{*static_cast<index_t*>(args[1])};
+  index_t position = data_offset[fid] + iid;
+  // index_t position = iid;
+
+  // assert(length > 0 && position < length);
+  assert(length > 0);
+
+  if (position < length) {
+    index = indices[position];
+  } else {
+    index = static_cast<index_t>(-1);
+  }
+}
+
+template<typename O, typename I>
+__host__ __device__
+X_INL void AggregateThunderGBM(
+    volatile O& dst, const I* src,
+    const index_t iid, const index_t fid, void** args)
+{
+  assert(args && args[0] && args[1]);
+
+  auto gh_data{static_cast<GHPair*>(args[0])};
+  index_t length{*static_cast<index_t*>(args[1])};
+
+  if (fid >= length) {
+    return;
+  }
+
+#ifndef __CUDA_ARCH__
+#if __cplusplus >= 202002L
+  std::atomic<float_type> atomic_g{dst.g};
+  std::atomic<float_type> atomic_h{dst.h};
+
+  atomic_g.fetch_add(gh_data[fid].g, std::memory_order_release);
+  dst.g = atomic_g.load(std::memory_order_acquire);
+
+  atomic_h.fetch_add(gh_data[fid].h, std::memory_order_release);
+  dst.h = atomic_h.load(std::memory_order_acquire);
+#else
+  printf("Atomic operations for floating numbers are not implemented before C++20.\n");
+#endif  // __cplusplus
+#else
+  if (gh_data[fid].g != static_cast<float_type>(0)) {
+    atomicAdd(const_cast<float_type*>(&dst.g), gh_data[fid].g);
+  }
+  if (gh_data[fid].h != static_cast<float_type>(0)) {
+    atomicAdd(const_cast<float_type*>(&dst.h), gh_data[fid].h);
+  }
+#endif
+}
+
 template<>
 class fasthb::build::Op<GHPair, GHPair>
 {
 public:
   using O = volatile GHPair;
   using I = GHPair;
-
-  template<aggregate::Method method>
-  __host__ __device__
-  X_INL static void Aggregate(volatile O& dst, const I& src)
-  {
-#ifndef __CUDA_ARCH__
-#if __cplusplus >= 202002L
-    std::atomic<float_type> atomic_g{dst.g};
-    std::atomic<float_type> atomic_h{dst.h};
-
-    (void)atomic_g.fetch_add(
-        static_cast<float_type>(src.g), std::memory_order_release);
-    dst.g = atomic_g.load(std::memory_order_acquire);
-
-    (void)atomic_h.fetch_add(
-        static_cast<float_type>(src.h), std::memory_order_release);
-    dst.h = atomic_h.load(std::memory_order_acquire);
-#else
-    printf("Atomic operations for floating numbers are not implemented before C++20.\n");
-#endif  // __cplusplus
-#else
-    if (src.g != static_cast<float_type>(0)) {
-      (void)atomicAdd(
-          const_cast<float_type*>(&dst.g), static_cast<float_type>(src.g));
-    }
-    if (src.h != static_cast<float_type>(0)) {
-      (void)atomicAdd(
-          const_cast<float_type*>(&dst.h), static_cast<float_type>(src.h));
-    }
-#endif
-  }
-
-  template<binning::Method method>
-  __host__ __device__
-  X_INL static void Binning(index_t& index, const I& input, void* rest)
-  {
-    auto param{static_cast<binning::GivenIndexParam*>(rest)};
-    binning::GivenIndex(index, param->iteration, param->indices, param->length);
-  }
-
-  __host__ __device__
-  X_INL static void GetBinWidth(
-      I& bin_width, const index_t& num_bin, const I& lower, const I& upper)
-  {
-  }
 
   template<typename O>
   __host__ __device__
@@ -143,7 +175,7 @@ public:
 
   template<bool atomic, typename O>
   __host__ __device__
-  X_INL static void Reduce(volatile O& dst, const O& src)
+  X_INL static void Reduce(O& dst, const O& src)
   {
     if constexpr (atomic) {
 #ifndef __CUDA_ARCH__
@@ -151,24 +183,20 @@ public:
       std::atomic<float_type> atomic_g{dst.g};
       std::atomic<float_type> atomic_h{dst.h};
 
-      (void)atomic_g.fetch_add(
-          static_cast<float_type>(src.g), std::memory_order_release);
+      atomic_g.fetch_add(src.g, std::memory_order_release);
       dst.g = atomic_g.load(std::memory_order_acquire);
 
-      (void)atomic_h.fetch_add(
-          static_cast<float_type>(src.h), std::memory_order_release);
+      atomic_h.fetch_add(src.h, std::memory_order_release);
       dst.h = atomic_h.load(std::memory_order_acquire);
 #else
-#endif  // __cplusplus
       printf("Atomic operations for floating numbers are not implemented before C++20.\n");
+#endif  // __cplusplus >= 202002L
 #else
       if (src.g != static_cast<float_type>(0)) {
-        (void)atomicAdd(
-            const_cast<float_type*>(&dst.g), static_cast<float_type>(src.g));
+        atomicAdd(&dst.g, static_cast<float_type>(src.g));
       }
       if (src.h != static_cast<float_type>(0)) {
-        (void)atomicAdd(
-            const_cast<float_type*>(&dst.h), static_cast<float_type>(src.h));
+        atomicAdd(&dst.h, static_cast<float_type>(src.h));
       }
 #endif
     } else {

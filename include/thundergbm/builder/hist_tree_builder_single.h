@@ -10,8 +10,9 @@
 #include "shard.h"
 #include "tree_builder.h"
 
+#include "fasthb.cuh"
 #include "fasthb/impl/build_global_memory.cuh"
-// #include "fasthb/impl/builder_shared_memory.cuh"
+#include "fasthb/impl/build_shared_memory.cuh"
 
 
 class HistTreeBuilder_single : public TreeBuilder {
@@ -49,7 +50,8 @@ private:
     double total_copy_time = 0;
     bool use_gpu = 1;
 
-    fasthb::build::GlobalMemory<GHPair, GHPair> builder;
+    fasthb::build::GlobalMemory<GHPair, float_type> m_builder;
+    // fasthb::build::SharedMemory<GHPair, float_type> m_builder;
 };
 
 
