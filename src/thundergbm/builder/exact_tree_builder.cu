@@ -31,18 +31,16 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
 
     //find the best split locally
     {
-        using namespace thrust;
-
         //calculate split information for each split
         int n_split;
         SyncArray<GHPair> gh_prefix_sum(nnz);
         SyncArray<GHPair> missing_gh(n_partition);
         SyncArray<int_float> rle_key(nnz);
         if (nnz * 4 > 1.5 * (1 << 30)) rle_key.resize(int(nnz * 0.1));
-        auto rle_pid_data = make_transform_iterator(rle_key.device_data(),
-                                                    [=]__device__(int_float key) { return get<0>(key); });
-        auto rle_fval_data = make_transform_iterator(rle_key.device_data(),
-                                                     [=]__device__(int_float key) { return get<1>(key); });
+        auto rle_pid_data = thrust::make_transform_iterator(rle_key.device_data(),
+                                                    [=] __host__ __device__(int_float key) { return thrust::get<0>(key); });
+        auto rle_fval_data = thrust::make_transform_iterator(rle_key.device_data(),
+                                                     [=] __host__ __device__(int_float key) { return thrust::get<1>(key); });
         {
 
             //gather g/h pairs and do prefix sum
@@ -78,7 +76,7 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                     //get feature value id mapping for partition, new -> old
                     {
 //                    TIMED_SCOPE(timerObj, "fvid_new2old");
-                        sequence(cuda::par, fvid_new2old.device_data(), fvid_new2old.device_end(), 0);
+                        sequence(thrust::cuda::par, fvid_new2old.device_data(), fvid_new2old.device_end(), 0);
 
                         //using prefix sum memory for temporary storage
                         cub_sort_by_key(fvid2pid, fvid_new2old, -1, true, (void *) gh_prefix_sum.device_data());
@@ -95,15 +93,15 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                     auto key_iter = make_zip_iterator(
                             make_tuple(
                                     fvid2pid.device_data(),
-                                    make_permutation_iterator(
+                                    thrust::make_permutation_iterator(
                                             columns.csc_val.device_data(),
                                             fvid_new2old.device_data())));//use fvid_new2old to access csc_val
-                    n_split = reduce_by_key(
-                            cuda::par,
+                    n_split = thrust::reduce_by_key(
+                            thrust::cuda::par,
                             key_iter, key_iter + nnz,
-                            make_permutation_iterator(                   //ins id -> gh pair
+                            thrust::make_permutation_iterator(                   //ins id -> gh pair
                                     gh_pair.device_data(),
-                                    make_permutation_iterator(                 //old fvid -> ins id
+                                    thrust::make_permutation_iterator(                 //old fvid -> ins id
                                             columns.csc_row_idx.device_data(),
                                             fvid_new2old.device_data())),             //new fvid -> old fvid
                             rle_key.device_data(),
@@ -113,8 +111,8 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                     LOG(DEBUG) << "RLE ratio = " << (float) n_split / nnz;
 
                     //prefix sum
-                    inclusive_scan_by_key(
-                            cuda::par,
+                    thrust::inclusive_scan_by_key(
+                            thrust::cuda::par,
                             rle_pid_data, rle_pid_data + n_split,
                             gh_prefix_sum.device_data(),
                             gh_prefix_sum.device_data());
@@ -128,8 +126,8 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
         {
             TIMED_SCOPE(timerObj, "find _split - calculate missing value");
             SyncArray<int> pid_ptr(n_partition + 1);
-            counting_iterator<int> search_begin(0);
-            upper_bound(cuda::par, rle_pid_data, rle_pid_data + n_split, search_begin,
+            thrust::counting_iterator<int> search_begin(0);
+            thrust::upper_bound(thrust::cuda::par, rle_pid_data, rle_pid_data + n_split, search_begin,
                         search_begin + n_partition, pid_ptr.device_data() + 1);
             LOG(DEBUG) << "pid_ptr = " << pid_ptr;
 
@@ -148,10 +146,10 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
                     float_type f = fval_data[i];
                     if ((pid_ptr_data[pid + 1] - 1) == i)//the last RLE
                         //using "get" to get a modifiable lvalue
-                        get<1>(rle_key_data[i]) = (f - fabsf(fval_data[pid_ptr_data[pid]]) - rt_eps);
+                        thrust::get<1>(rle_key_data[i]) = (f - fabsf(fval_data[pid_ptr_data[pid]]) - rt_eps);
                     else
                         //FIXME read/write collision
-                        get<1>(rle_key_data[i]) = (f + fval_data[i + 1]) * 0.5f;
+                        thrust::get<1>(rle_key_data[i]) = (f + fval_data[i + 1]) * 0.5f;
                 });
             }
 
@@ -218,18 +216,18 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
         {
             TIMED_SCOPE(timerObj, "find_split - get best gain");
             auto arg_abs_max = []__device__(const int_float &a, const int_float &b) {
-                if (fabsf(get<1>(a)) == fabsf(get<1>(b)))
-                    return get<0>(a) < get<0>(b) ? a : b;
+                if (fabsf(thrust::get<1>(a)) == fabsf(thrust::get<1>(b)))
+                    return thrust::get<0>(a) < thrust::get<0>(b) ? a : b;
                 else
-                    return fabsf(get<1>(a)) > fabsf(get<1>(b)) ? a : b;
+                    return fabsf(thrust::get<1>(a)) > fabsf(thrust::get<1>(b)) ? a : b;
             };
 
             //reduce to get best split of each node for this feature
             SyncArray<int> feature_nodes_pid(n_partition);
-            int n_feature_with_nodes = reduce_by_key(
-                    cuda::par,
+            int n_feature_with_nodes = thrust::reduce_by_key(
+                    thrust::cuda::par,
                     rle_pid_data, rle_pid_data + n_split,
-                    make_zip_iterator(make_tuple(counting_iterator<int>(0), gain.device_data())),
+                    thrust::make_zip_iterator(thrust::make_tuple(thrust::counting_iterator<int>(0), gain.device_data())),
                     feature_nodes_pid.device_data(),
                     best_idx_gain.device_data(),
                     thrust::equal_to<int>(),
@@ -247,11 +245,11 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
             cub_sort_by_key(feature_nodes_pid, best_idx_gain, n_feature_with_nodes);
             LOG(DEBUG) << "f n pid" << feature_nodes_pid;
             LOG(DEBUG) << "best rank & gain = " << best_idx_gain;
-            n_nodes_in_level = reduce_by_key(
-                    cuda::par,
+            n_nodes_in_level = thrust::reduce_by_key(
+                    thrust::cuda::par,
                     feature_nodes_pid.device_data(), feature_nodes_pid.device_data() + n_feature_with_nodes,
                     best_idx_gain.device_data(),
-                    make_discard_iterator(),
+                    thrust::make_discard_iterator(),
                     best_idx_gain.device_data(),
                     thrust::equal_to<int>(),
                     arg_abs_max
@@ -275,8 +273,8 @@ void ExactTreeBuilder::find_split(int level, int device_id) {
         });
         device_loop(n_nodes_in_level, [=]__device__(int i) {
             int_float bst = best_idx_gain_data[i];
-            float_type best_split_gain = get<1>(bst);
-            int split_index = get<0>(bst);
+            float_type best_split_gain = thrust::get<1>(bst);
+            int split_index = thrust::get<0>(bst);
             int pid = rle_pid_data[split_index];
             if (pid != INT_MAX) {
                 int nid0 = pid % n_max_nodes_in_level;

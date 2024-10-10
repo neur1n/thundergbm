@@ -17,7 +17,6 @@ void HistTreeBuilder::get_bin_ids() {
         SparseColumns &columns = shards[device_id].columns;
         HistCut &cut = this->cut[device_id];
         auto &dense_bin_id = this->dense_bin_id[device_id];
-        using namespace thrust;
         int n_column = columns.n_column;
         int nnz = columns.nnz;
         auto cut_row_ptr = cut.cut_row_ptr.device_data();
@@ -91,15 +90,14 @@ void HistTreeBuilder::find_split(int level, int device_id) {
 
     //find the best split locally
     {
-        using namespace thrust;
         auto t_build_start = timer.now();
 
         //calculate split information for each split
         SyncArray<GHPair> hist(n_max_splits);
         SyncArray<GHPair> missing_gh(n_partition);
         auto cut_fid_data = cut.cut_fid.device_data();
-        auto i2fid = [=] __device__(int i) { return cut_fid_data[i % n_bins]; };
-        auto hist_fid = make_transform_iterator(counting_iterator<int>(0), i2fid);
+        auto i2fid = [=] __host__ __device__(int i) { return cut_fid_data[i % n_bins]; };
+        auto hist_fid = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), i2fid);
         {
             {
                 TIMED_SCOPE(timerObj, "build hist");
@@ -176,14 +174,14 @@ void HistTreeBuilder::find_split(int level, int device_id) {
                             TIMED_SCOPE(timerObj, "data partitioning");
                             SyncArray<int> nid4sort(n_instances);
                             nid4sort.copy_from(ins2node_id[device_id]);
-                            sequence(cuda::par, node_idx.device_data(), node_idx.device_end(), 0);
+                            thrust::sequence(thrust::cuda::par, node_idx.device_data(), node_idx.device_end(), 0);
                             cub_sort_by_key(nid4sort, node_idx);
-                            auto counting_iter = make_counting_iterator < int > (nid_offset);
+                            auto counting_iter = thrust::make_counting_iterator < int > (nid_offset);
                             node_ptr.host_data()[0] =
-                                    lower_bound(cuda::par, nid4sort.device_data(), nid4sort.device_end(), nid_offset) -
+                                    thrust::lower_bound(thrust::cuda::par, nid4sort.device_data(), nid4sort.device_end(), nid_offset) -
                                     nid4sort.device_data();
 
-                            upper_bound(cuda::par, nid4sort.device_data(), nid4sort.device_end(), counting_iter,
+                            thrust::upper_bound(thrust::cuda::par, nid4sort.device_data(), nid4sort.device_end(), counting_iter,
                                         counting_iter + n_nodes_in_level, node_ptr.device_data() + 1);
                             LOG(DEBUG) << "node ptr = " << node_ptr;
                             cudaDeviceSynchronize();
@@ -207,7 +205,7 @@ void HistTreeBuilder::find_split(int level, int device_id) {
                             int n_ins_right = node_ptr_data[nid0_to_substract + 1] - node_ptr_data[nid0_to_substract];
                             if (max(n_ins_left, n_ins_right) == 0) continue;
                             if (n_ins_left > n_ins_right)
-                                swap(nid0_to_compute, nid0_to_substract);
+                                thrust::swap(nid0_to_compute, nid0_to_substract);
 
                             //compute
                             {
@@ -305,7 +303,7 @@ void HistTreeBuilder::find_split(int level, int device_id) {
                 LOG(DEBUG) << "-------------->>> cp_time::::: " << this->total_copy_time;
 
                 //LOG(DEBUG) << "cutfid = " << cut.cut_fid;
-                inclusive_scan_by_key(cuda::par, hist_fid, hist_fid + n_split,
+                thrust::inclusive_scan_by_key(thrust::cuda::par, hist_fid, hist_fid + n_split,
                                       hist.device_data(), hist.device_data());
                 LOG(DEBUG) << hist;
 
@@ -375,19 +373,19 @@ void HistTreeBuilder::find_split(int level, int device_id) {
         {
 //            TIMED_SCOPE(timerObj, "get best gain");
             auto arg_abs_max = []__device__(const int_float &a, const int_float &b) {
-                if (fabsf(get<1>(a)) == fabsf(get<1>(b)))
-                    return get<0>(a) < get<0>(b) ? a : b;
+                if (fabsf(thrust::get<1>(a)) == fabsf(thrust::get<1>(b)))
+                    return thrust::get<0>(a) < thrust::get<0>(b) ? a : b;
                 else
-                    return fabsf(get<1>(a)) > fabsf(get<1>(b)) ? a : b;
+                    return fabsf(thrust::get<1>(a)) > fabsf(thrust::get<1>(b)) ? a : b;
             };
 
-            auto nid_iterator = make_transform_iterator(counting_iterator<int>(0), placeholders::_1 / n_bins);
+            auto nid_iterator = thrust::make_transform_iterator(thrust::counting_iterator<int>(0), thrust::placeholders::_1 / n_bins);
 
-            reduce_by_key(
-                    cuda::par,
+            thrust::reduce_by_key(
+                    thrust::cuda::par,
                     nid_iterator, nid_iterator + n_split,
-                    make_zip_iterator(make_tuple(counting_iterator<int>(0), gain.device_data())),
-                    make_discard_iterator(),
+                    thrust::make_zip_iterator(thrust::make_tuple(thrust::counting_iterator<int>(0), gain.device_data())),
+                    thrust::make_discard_iterator(),
                     best_idx_gain.device_data(),
                     thrust::equal_to<int>(),
                     arg_abs_max
@@ -412,8 +410,8 @@ void HistTreeBuilder::find_split(int level, int device_id) {
             auto cut_row_ptr_data = cut.cut_row_ptr.device_data();
             device_loop(n_nodes_in_level, [=]__device__(int i) {
                 int_float bst = best_idx_gain_data[i];
-                float_type best_split_gain = get<1>(bst);
-                int split_index = get<0>(bst);
+                float_type best_split_gain = thrust::get<1>(bst);
+                int split_index = thrust::get<0>(bst);
                 if (!nodes_data[i + nid_offset].is_valid) {
                     sp_data[i].split_fea_id = -1;
                     sp_data[i].nid = -1;

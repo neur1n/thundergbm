@@ -187,7 +187,7 @@ namespace thunder {
             }
         }
 
-        mutex.Lock();
+        mutex.lock();
         // Iterate through the range of cached blocks on the same device in the same bin
         CachedBlocks::iterator block_itr = cached_blocks.lower_bound(search_key);
         while ((block_itr != cached_blocks.end())
@@ -224,7 +224,7 @@ namespace thunder {
         }
 
         // Done searching: unlock
-        mutex.Unlock();
+        mutex.unlock();
 
         // Allocate the block if necessary
         if (!found) {
@@ -245,7 +245,7 @@ namespace thunder {
                 cudaGetLastError();     // Reset CUDART's error
 
                 // Lock
-                mutex.Lock();
+                mutex.lock();
 
                 // Iterate the range of free blocks on the same device
                 BlockDescriptor free_key(device);
@@ -274,8 +274,8 @@ namespace thunder {
                     block_itr++;
                 }
 
-                // Unlock
-                mutex.Unlock();
+                // unlock
+                mutex.unlock();
 
                 // Return under error
                 if (error) return error;
@@ -289,10 +289,10 @@ namespace thunder {
                 return error;
 
             // Insert into live blocks
-            mutex.Lock();
+            mutex.lock();
             live_blocks.insert(search_key);
             cached_bytes[device].live += search_key.bytes;
-            mutex.Unlock();
+            mutex.unlock();
 
             if (debug)
                 _CubLog("\tDevice %d allocated new device block at %p (%lld bytes associated with stream %lld).\n",
@@ -352,7 +352,7 @@ namespace thunder {
             }
         }
 
-        mutex.Lock();
+        mutex.lock();
         // Iterate through the range of cached blocks on the same device in the same bin
         CachedBlocks::iterator block_itr = cached_blocks.lower_bound(search_key);
         while ((block_itr != cached_blocks.end())
@@ -389,7 +389,7 @@ namespace thunder {
         }
 
         // Done searching: unlock
-        mutex.Unlock();
+        mutex.unlock();
 
         // Allocate the block if necessary
         if (!found) {
@@ -410,7 +410,7 @@ namespace thunder {
                 cudaGetLastError();     // Reset CUDART's error
 
                 // Lock
-                mutex.Lock();
+                mutex.lock();
 
                 // Iterate the range of free blocks on the same device
                 BlockDescriptor free_key(device);
@@ -439,8 +439,8 @@ namespace thunder {
                     block_itr++;
                 }
 
-                // Unlock
-                mutex.Unlock();
+                // unlock
+                mutex.unlock();
 
                 // Return under error
                 if (error) return error;
@@ -454,10 +454,10 @@ namespace thunder {
                 return error;
 
             // Insert into live blocks
-            mutex.Lock();
+            mutex.lock();
             live_blocks.insert(search_key);
             cached_bytes[device].live += search_key.bytes;
-            mutex.Unlock();
+            mutex.unlock();
 
             if (debug)
                 _CubLog("\tDevice %d allocated new device block at %p (%lld bytes associated with stream %lld).\n",
@@ -496,7 +496,7 @@ namespace thunder {
         }
 
         // Lock
-        mutex.Lock();
+        mutex.lock();
 
         // Find corresponding block descriptor
         bool recached = false;
@@ -524,8 +524,8 @@ namespace thunder {
             }
         }
 
-        // Unlock
-        mutex.Unlock();
+        // unlock
+        mutex.unlock();
 
         // First set to specified device (entrypoint may not be set)
         if (device != entrypoint_device) {
@@ -565,7 +565,7 @@ namespace thunder {
         int entrypoint_device = INVALID_DEVICE_ORDINAL;
         int current_device = INVALID_DEVICE_ORDINAL;
 
-        mutex.Lock();
+        mutex.lock();
 
         while (!cached_blocks.empty()) {
             // Get first block
@@ -598,7 +598,7 @@ namespace thunder {
             cached_blocks.erase(begin);
         }
 
-        mutex.Unlock();
+        mutex.unlock();
 
         // Attempt to revert back to entry-point device if necessary
         if (entrypoint_device != INVALID_DEVICE_ORDINAL) {
