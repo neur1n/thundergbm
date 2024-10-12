@@ -32,7 +32,8 @@ long long total_evaluate_time;
 template<typename O, typename I>
 __global__
 void KernelRoot_GMem(
-    volatile O* hist, const index_t num_hist, const index_t num_bin,
+    volatile O* hist, const std::ptrdiff_t hist_offset,
+    const index_t num_hist, const index_t num_bin,
     const index_t avail_hist, const index_t hist_begin, const index_t hist_end,
     const I* data, const index_t num_feat, const index_t num_inst,
     const index_t* data_offset, const index_t data_offset_len,
@@ -43,15 +44,50 @@ void KernelRoot_GMem(
     int* csr_bin_id_data = static_cast<int*>(args);
 
     unsigned int i = blockIdx.x;
-    if (i >= data_offset_len) {
-      printf("i=%d, data_offset_len=%d\n", i, data_offset_len);
-    }
     index_t begin = data_offset[i];
     index_t end = data_offset[i + 1];
     for (unsigned int j = begin + blockIdx.y * blockDim.x + threadIdx.x; j < end; j += blockDim.x * gridDim.y) {
         int bid = (int)csr_bin_id_data[j];
         const GHPair src = (GHPair)data[i];
-        volatile GHPair &dest = hist[bid];
+        volatile GHPair &dest = hist[hist_offset + bid];
+        if(src.h != 0) {
+            atomicAdd((float_type*)&dest.h, src.h);
+        }
+        if(src.g != 0) {
+            atomicAdd((float_type*)&dest.g, src.g);
+        }
+    }
+}
+
+typedef struct _KernelNodeArgs_
+{
+  int* node_idx_data{nullptr};
+  int* csr_bin_id_data{nullptr};
+  int idx_begin{0};
+} KernelNodeArgs;
+
+template<typename O, typename I>
+__global__
+void KernelNode_GMem(
+    volatile O* hist, const std::ptrdiff_t hist_offset,
+    const index_t num_hist, const index_t num_bin,
+    const index_t avail_hist, const index_t hist_begin, const index_t hist_end,
+    const I* data, const index_t num_feat, const index_t num_inst,
+    const index_t* data_offset, const index_t data_offset_len,
+    const int64_t feature, const fasthb::data::Bound<I>* bound, void* args)
+{
+    assert(hist && data && data_offset && data_offset_len > 0 && args);
+
+    KernelNodeArgs* kargs = static_cast<KernelNodeArgs*>(args);
+
+    unsigned int i = blockIdx.x;
+    unsigned int iid = kargs->node_idx_data[i + kargs->idx_begin];
+    index_t begin = data_offset[iid];
+    index_t end = data_offset[iid + 1];
+    for (unsigned int j = begin + blockIdx.y * blockDim.x + threadIdx.x; j < end; j += blockDim.x * gridDim.y) {
+        int bid = (int)kargs->csr_bin_id_data[j];
+        const GHPair src = (GHPair)data[iid];
+        volatile GHPair &dest = hist[hist_offset + bid];
         if(src.h != 0) {
             atomicAdd((float_type*)&dest.h, src.h);
         }
@@ -232,6 +268,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
 
     fasthb::build::kernel_t<GHPair, GHPair> run[] = {
         KernelRoot_GMem<GHPair, GHPair>,
+        KernelNode_GMem<GHPair, GHPair>,
     };
 
     fasthb::resource::Occupancy occupancy;
@@ -262,6 +299,8 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
 
                         TSTART(hist)
 
+                        // NOTE: It is non-zero after node histograms are built.
+                        hist.Offset() = 0;
                         // FIXME: Fix the pre[...] usage.
                         build.Pre(
                             occupancy, config, hist, input, -1, device_id,
@@ -557,31 +596,56 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 auto hist_data = (GHPair*)hist.Data() + computed_hist_pos*n_bins;
                                 this->total_hist_num++;
 
+                                hist.Offset() = computed_hist_pos * n_bins;
+
+                                KernelNodeArgs h_args;
+                                h_args.node_idx_data = node_idx_data;
+                                h_args.csr_bin_id_data = csr_bin_id_data;
+                                h_args.idx_begin = idx_begin;
+
+                                KernelNodeArgs* d_args = nullptr;
+                                cudaMalloc(&d_args, sizeof(KernelNodeArgs));
+                                cudaMemcpy(d_args, &h_args, sizeof(KernelNodeArgs), cudaMemcpyDefault);
+
                                 //reset zero
                                 cudaMemset(hist_data, 0, n_bins*sizeof(GHPair));
 
-                                //new csr loop
-                                device_loop_hist_csr_node((idx_end - idx_begin),csr_row_ptr_data, [=]__device__(int i,int current_pos,int stride){
-                                    //iid
-                                    int iid = node_idx_data[i+idx_begin];
-                                    int begin = csr_row_ptr_data[iid];
-                                    int end = csr_row_ptr_data[iid+1];
-                                    for(int j = begin+current_pos;j<end;j+=stride){
-                                        //int fid = csr_col_idx_data[j];
-                                        int bid = (int)csr_bin_id_data[j];
+                                // FIXME: Fix the pre[...] usage.
+                                build.Pre(
+                                    occupancy, config, hist, input, -1, device_id,
+                                    fasthb::resource::Method::CUDA, 0, run[1]/*, pre[0]*/);
+                                // NOTE: A workaround to use ThunderGBM's launch configuration.
+                                build.Config().gridDim.x = idx_end - idx_begin;
+                                build.Config().gridDim.y = n_block;
+                                build.Config().blockDim.x = 256;
+                                if (build.Config().gridDim.x > 0) {
+                                    build.Run(
+                                        elapsed, hist, input, -1, run[1],
+                                        fasthb::build::DefaultRun, d_args);
+                                }
 
-                                        //int feature_offset = cut_row_ptr_data[fid];
-                                        const GHPair src = gh_data[iid];
-                                        //GHPair &dest = hist_data[feature_offset + bid];
-                                        GHPair &dest = hist_data[bid];
-                                        if(src.h!= 0){
-                                            atomicAdd(&dest.h, src.h);
-                                        }
-                                        if(src.g!= 0){
-                                            atomicAdd(&dest.g, src.g);
-                                        }
-                                    }
-                                },n_block);
+                                //new csr loop
+                                //device_loop_hist_csr_node((idx_end - idx_begin),csr_row_ptr_data, [=]__device__(int i,int current_pos,int stride){
+                                //    //iid
+                                //    int iid = node_idx_data[i+idx_begin];
+                                //    int begin = csr_row_ptr_data[iid];
+                                //    int end = csr_row_ptr_data[iid+1];
+                                //    for(int j = begin+current_pos;j<end;j+=stride){
+                                //        //int fid = csr_col_idx_data[j];
+                                //        int bid = (int)csr_bin_id_data[j];
+
+                                //        //int feature_offset = cut_row_ptr_data[fid];
+                                //        const GHPair src = gh_data[iid];
+                                //        //GHPair &dest = hist_data[feature_offset + bid];
+                                //        GHPair &dest = hist_data[bid];
+                                //        if(src.h!= 0){
+                                //            atomicAdd(&dest.h, src.h);
+                                //        }
+                                //        if(src.g!= 0){
+                                //            atomicAdd(&dest.g, src.g);
+                                //        }
+                                //    }
+                                //},n_block);
                                     //device_loop((idx_end - idx_begin),[=]__device__(int i ){
                                     //    int iid = node_idx_data[i+idx_begin];
                                     //    int begin = csr_row_ptr_data[iid];
@@ -601,6 +665,7 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                     //});
 
                                 
+                                cudaFree(d_args);
                             }
                             if(max_trick_depth<0 || level<=max_trick_depth||(nid0_to_substract / 2)<max_trick_nodes){
                                 //subtract
@@ -627,25 +692,51 @@ void HistTreeBuilder_single::find_split(int level, int device_id) {
                                 auto idx_end = node_ptr.host_data()[nid0 + 1];
                                 auto hist_data = (GHPair*)hist.Data() + to_compute_hist_pos*n_bins;
 
+                                hist.Offset() = computed_hist_pos * n_bins;
+
+                                KernelNodeArgs h_args;
+                                h_args.node_idx_data = node_idx_data;
+                                h_args.csr_bin_id_data = csr_bin_id_data;
+                                h_args.idx_begin = idx_begin;
+
+                                KernelNodeArgs* d_args = nullptr;
+                                cudaMalloc(&d_args, sizeof(KernelNodeArgs));
+                                cudaMemcpy(d_args, &h_args, sizeof(KernelNodeArgs), cudaMemcpyDefault);
+
                                 cudaMemset(hist_data, 0, n_bins*sizeof(GHPair));
 
-                                device_loop_hist_csr_node((idx_end - idx_begin),csr_row_ptr_data, [=]__device__(int i,int current_pos,int stride){
-                                    int iid = node_idx_data[i+idx_begin];
-                                    int begin = csr_row_ptr_data[iid];
-                                    int end = csr_row_ptr_data[iid+1];
-                                    for(int j = begin+current_pos;j<end;j+=stride){
-                                        int bid = (int)csr_bin_id_data[j];
-                                        const GHPair src = gh_data[iid];
-                                        GHPair &dest = hist_data[bid];
-                                        if(src.h!= 0){
-                                            atomicAdd(&dest.h, src.h);
-                                        }
-                                        if(src.g!= 0){
-                                            atomicAdd(&dest.g, src.g);
-                                        }
-                                    }
-                                },n_block);
+                                // FIXME: Fix the pre[...] usage.
+                                build.Pre(
+                                    occupancy, config, hist, input, -1, device_id,
+                                    fasthb::resource::Method::CUDA, 0, run[1]/*, pre[0]*/);
+                                // NOTE: A workaround to use ThunderGBM's launch configuration.
+                                build.Config().gridDim.x = idx_end - idx_begin;
+                                build.Config().gridDim.y = n_block;
+                                build.Config().blockDim.x = 256;
+                                if (build.Config().gridDim.x > 0) {
+                                    build.Run(
+                                        elapsed, hist, input, -1, run[1],
+                                        fasthb::build::DefaultRun, d_args);
+                                }
 
+                                // device_loop_hist_csr_node((idx_end - idx_begin),csr_row_ptr_data, [=]__device__(int i,int current_pos,int stride){
+                                //     int iid = node_idx_data[i+idx_begin];
+                                //     int begin = csr_row_ptr_data[iid];
+                                //     int end = csr_row_ptr_data[iid+1];
+                                //     for(int j = begin+current_pos;j<end;j+=stride){
+                                //         int bid = (int)csr_bin_id_data[j];
+                                //         const GHPair src = gh_data[iid];
+                                //         GHPair &dest = hist_data[bid];
+                                //         if(src.h!= 0){
+                                //             atomicAdd(&dest.h, src.h);
+                                //         }
+                                //         if(src.g!= 0){
+                                //             atomicAdd(&dest.g, src.g);
+                                //         }
+                                //     }
+                                // },n_block);
+
+                                cudaFree(d_args);
                             }
                             TEND(hist)
                             total_hist_time+=TINT(hist);
